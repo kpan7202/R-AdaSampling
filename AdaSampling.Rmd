@@ -1,0 +1,265 @@
+---
+title: "Assignment 2"
+author: "Kurniawan Pranogo Panjiarto (460473970)"
+date: "October 10, 2017"
+output: html_document
+---
+
+##Load Dataset
+```{r}
+dt <- read.csv("InsulinPhospho.txt", sep = "\t")
+akt <- read.csv("Akt_substrates.txt", header = FALSE)
+mtor <- read.csv("mTOR_substrates.txt", header = FALSE)
+
+labels <- data.frame(matrix(NA,nrow=nrow(dt),ncol=2))
+colnames(labels) <- c("Akt","mTOR")
+for (i in akt[[1]]) {
+  idx <- which(apply(dt, 1, function(x) any(grepl(i, x))))
+  labels$Akt[idx] <- 1
+  labels$mTOR[idx] <- 0
+}
+for (i in mtor[[1]]) {
+  idx <- which(apply(dt, 1, function(x) any(grepl(i, x))))
+  labels$Akt[idx] <- 0
+  labels$mTOR[idx] <- 1
+}
+```
+
+##Add new feature variance of time points observed
+```{r}
+for(i in 1:nrow(dt)) {
+  dt$X.Var[i] <- var(as.numeric(dt[i,5:12]))
+}
+```
+
+##Add new feature PSSM
+```{r}
+protein <- c("A","C","D","E","F","G","H","I","K","L","M","N","P","Q","R","S","T","V","W","Y")
+PFM <- matrix(0,nrow = 20, ncol = 13)
+for(motif in dt[,2]) {
+  ctr <- 1
+  for (x in strsplit(motif, "")[[1]]) {
+    if (x != "_") {
+      pos <- match(x, protein)
+      PFM[pos,ctr] <- PFM[pos,ctr] + 1
+    }
+    ctr <- ctr + 1
+  }
+}
+
+PPM <- PFM %*% diag(1 / colSums(PFM))
+bk <- rowSums(PFM) / sum(PFM)
+PWM <- log2(PPM / bk)
+
+idx <- 1
+for(motif in dt[,2]) {
+  ctr <- 1
+  total <- 0
+  for (x in strsplit(motif, "")[[1]]) {
+    if (x != "_") {
+      pos <- match(x, protein)
+      total <- total + PWM[pos, ctr]
+    }
+    ctr <- ctr + 1
+  }
+  dt$PSSM[idx] <- total
+  idx <- idx + 1
+}
+
+
+```
+
+
+
+##Adaptive Sampling
+```{r, warning=FALSE}
+library(e1071)
+library(randomForest)
+
+Adaptive.Sampling <- function(X,Y, err = 0.01, max.sampling = 10000, n.tree = 1000, percentage.features = 1.0) {
+  # split data between labeled and unlabeled for specific kinase
+  labeled.index <- which(!is.na(Y))
+  labeled.data <- X[labeled.index[which(Y[labeled.index] == 1)],]
+  unlabeled.index <- which(is.na(Y))
+  unlabeled.data <- X[unlabeled.index,]
+  # set initial probability weight to 1
+  unlabeled.data$weight <- 1
+  # set the labeled phosphorylation sites to 1 and the unlabeled to 0
+  y.train <- as.factor(c(rep(1,nrow(labeled.data)), rep(0,nrow(labeled.data))))
+  
+  prev.prob = 1
+  min.x.train <- NA
+  min.score <- 1
+  ctr <- 0
+  repeat {
+    ctr <- ctr + 1
+    # sample unlabeled data
+    sample.unlabeled.index <- sample(1:nrow(unlabeled.data), nrow(labeled.data), TRUE, unlabeled.data$weight)
+    # concat labeled and unlabeled data to construct training set
+    x.train <- rbind(labeled.data, unlabeled.data[sample.unlabeled.index,-ncol(unlabeled.data)])
+    # fit to model
+    svm_radial <- svm(x.train, y.train, type="C-classification", kernel = "radial", scale = FALSE, probability = TRUE)
+    svm_radial_pred <- predict(svm_radial, X, probability=TRUE) 
+    # get probability of label = 1
+    prob.pred <- attr(svm_radial_pred, "probabilities")[,'1']
+    # update the probability weight of negative labeled data
+    #unlabeled.data$weight <- pmin(unlabeled.data$weight, 1 - prob.pred[unlabeled.index])
+    # for prediction probability of positive class above 0.9, set the weight to 0
+    #unlabeled.data$weight[which(unlabeled.data$weight < 0.1)] = 0
+    
+    # calculate the score and store the minimum training set
+    score <- mean(abs(prob.pred - prev.prob))
+    if (score < min.score) {
+      min.score <- score
+      min.x.train <- x.train
+    }
+    
+    prev.prob <- prob.pred
+    # exit the loop if reaching max iteration or score is lower than threshold
+    if (score < err || ctr  >= max.sampling) {
+      break
+    }
+  }
+  
+  #cat(ctr, min.score,"\n")
+  # build ensemble model with different feature size
+  rf <- randomForest(min.x.train, y.train, xtest=X, mtry=round(percentage.features*ncol(X)), importance=TRUE, ntree=n.tree)
+  #print(rf$importance)
+  rf$test$votes[,'1']
+  #rf$test$predicted
+}
+```
+
+##Normalize the data and apply PCA, call adaptive sampling
+```{r, warning=FALSE}
+library(caret)
+source("functions_w6.R")
+preprocess.fit.predict.evaluate <- function(X,Y,threshold = 0.95,err = 0.01, max.sampling = 10000, n.tree = 1000, percentage.features = 1.0) {
+  pca <- preProcess(X,method=c("BoxCox", "center", "scale", "pca"), thresh = threshold)
+  pred.prob <- Adaptive.Sampling(predict(pca,X),Y,err = err, max.sampling = max.sampling, n.tree = n.tree, percentage.features = percentage.features)
+  #pred <- ifelse(pred.prob > 0.5, 1,0)
+  #labeled.index <- which(!is.na(Y))
+  #cm <- table(Y[labeled.index],pred[labeled.index])
+  #evaluate(cm[1,1], cm[1,2], cm[2,2], cm[2,1])
+  pred.prob
+}
+```
+
+## Load updated dataset
+```{r}
+new_data <- read.csv("processed_data_with_motif_negtive_cluster_new.csv")
+exclude_columns <- c(1:14,21,69:74)
+new_features <- new_data[,-exclude_columns]
+
+```
+
+##Predict Akt & mTOR
+```{r}
+if (file.exists("AdaSampling_prob_result.csv")) {
+  prob.result <- read.csv("AdaSampling_prob_result.csv")
+} else {
+  for (vari in c(0.7,0.8,0.9,0.95)) {
+    for (ft in c(0.6,0.7,0.8,0.9,1)) {
+      labels[paste("Akt", vari,ft, sep = "_")] <- preprocess.fit.predict.evaluate(new_features,labels$Akt,vari, percentage.features = ft)
+      labels[paste("mTOR", vari,ft, sep = "_")] <- preprocess.fit.predict.evaluate(new_features,labels$mTOR,vari, percentage.features = ft)
+    }
+  }
+  prob.result <- cbind(dt[,1], labels)
+  colnames(prob.result)[1] <- "Identifier"
+  #save to file
+  write.csv(prob.result, "prob_result.csv", row.names = FALSE)
+}
+```
+
+## Simulation using IOnosphere dataset
+```{r, warning=FALSE}
+library(mlbench)
+data("Ionosphere")
+
+sim.X <- Ionosphere[,3:34]
+sim.Y <- ifelse(Ionosphere[,35] == "good", 1,0)
+Y.labeled.index <- sample(which(sim.Y == 1),20)
+new.Y <- sim.Y
+new.Y[-Y.labeled.index] <- NA
+sim.Y.prob <- preprocess.fit.predict.evaluate(sim.X,new.Y,0.8,max.sampling = 1000)
+sim.Y.pred <- ifelse(sim.Y.prob > 0.5,1,0)
+cm <- table(sim.Y,sim.Y.pred)
+print(cm)
+evaluate(cm[1,1], cm[1,2], cm[2,2], cm[2,1])
+```
+
+## Calculate the prediction scores
+```{r}
+data.2016.akt <- read.csv("2016 result (Akt).csv")
+data.2016.mtor <- read.csv("2016 result (mTOR).csv")
+
+evaluation <- function(data.2016,result_from_model,threshold = 0.5) {
+  data.2016$modelResult <- with(result_from_model,
+                                result_from_model$avg.prob[match(data.2016$Name,                                                             result_from_model$identifier)])
+
+  if (class(data.2016$modelResult) == "factor") {
+    data.2016$modelResult <- as.numeric(levels(data.2016$modelResult))[data.2016$modelResult]
+  }
+  truth <- ifelse(data.2016$Full.model.predict>threshold,1,0)
+  result <- ifelse(data.2016$modelResult>threshold,1,0)
+  
+  TP <- c(sum((truth == result)[truth == 1]))
+  TN <- c(sum((truth == result)[truth == 0]))
+  FP <-  c(sum((truth != result)[truth == 0]))
+  FN <-  c(sum((truth != result)[truth == 1]))
+  
+  acc <- (TN+TP)/(TN+TP+FP+FN)*100
+  spec <- TN/(TN+FP)*100
+  sens <- TP/(TP+FN)*100
+  f1 <- 2*TP/(2*TP+FP+FN)*100
+  geo <- sqrt((TP/(TP+FN))*(TP/(TP+FP)))*100
+  
+  cat("accuracy =", round(acc,2),", ")
+  cat("sensitivity =",round(sens,2),", specificity =",round(spec,2),", ")
+  cat("f1 =" ,round(f1,2) , ", geo-mean =",round(geo,2),"\n")
+  c(acc,sens,spec,f1,geo)
+}
+
+scores = matrix(nrow = ncol(prob.result)-3,ncol = 6)
+i <- 1
+max.akt.score <- 0
+max.mtor.score <- 0
+best.akt <- ""
+best.mtor <- ""
+for (col in colnames(prob.result[,4:ncol(prob.result)])) {
+  model.result <- data.frame(cbind(as.character(prob.result$Identifier), prob.result[[col]]))
+  colnames(model.result) <- c("identifier", "avg.prob")
+  
+  if (substr(col,1,3) == "Akt") {
+    temp <- evaluation(data.2016.akt,model.result,0.5)
+    scores[i,] <- c(col,temp)
+    
+    if (temp[2] > max.akt.score) {
+      max.akt.score <- temp[2]
+      best.akt <- col
+    }
+  } else {
+    temp <- evaluation(data.2016.mtor,model.result,0.5)
+    scores[i,] <- c(col,temp)
+    if (temp[2] > max.mtor.score) {
+      max.mtor.score <- temp[2]
+      best.mtor <- col
+    }
+  }
+  
+  i <- i + 1
+}
+
+cat("Best Akt model", best.akt, "sensitivity:", max.akt.score)
+cat("Best mTOR model", best.mtor, "sensitivity:", max.mtor.score)
+
+colnames(scores) <- c("ID","Accuracy","Sensitivity","Specificity","F1-score", "Geo-mean")
+
+# save to file
+write.csv(scores, "AdaSampling_scores_result.csv", row.names = FALSE)
+write.table(new_data$identifier[which(prob.result[best.akt] > 0.5)], "AdaSampling_Akt_pred.csv", row.names = FALSE, col.names=FALSE)
+write.table(new_data$identifier[which(prob.result[best.mtor] > 0.5)], "AdaSampling_mTOR_pred.csv", row.names = FALSE, col.names=FALSE)
+
+```
+
+
